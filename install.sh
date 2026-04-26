@@ -62,8 +62,8 @@ fi
 
 # --- Download + verify --------------------------------------------------------
 
-TARBALL="publier-cli-${TAG}-${PLATFORM}.tar.gz"
-CHECKSUMS="publier-cli-${TAG}-checksums.txt"
+TARBALL="${TAG}-${PLATFORM}.tar.gz"
+CHECKSUMS="${TAG}-checksums.txt"
 TARBALL_URL="${DOWNLOAD_BASE}/${TAG}/${TARBALL}"
 CHECKSUMS_URL="${DOWNLOAD_BASE}/${TAG}/${CHECKSUMS}"
 
