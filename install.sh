@@ -35,6 +35,7 @@ warn() { printf "  %s!%s %s\n" "$c_yellow" "$c_reset" "$*"; }
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v tar  >/dev/null 2>&1 || die "tar is required"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
+command -v bun  >/dev/null 2>&1 || warn "bun not found — required for 'publier dev'. Install from https://bun.sh"
 
 # --- Platform detection -------------------------------------------------------
 
@@ -78,12 +79,20 @@ ok "downloaded $(du -h "$TMPDIR/$TARBALL" | awk '{print $1}')"
 info "Verifying SHA-256"
 if curl -fsSL "$CHECKSUMS_URL" -o "$TMPDIR/$CHECKSUMS" 2>/dev/null; then
 	EXPECTED="$(grep "  $TARBALL$" "$TMPDIR/$CHECKSUMS" | awk '{print $1}')"
-	[ -n "$EXPECTED" ] || die "tarball not listed in checksums file"
+	if [ -z "$EXPECTED" ]; then
+		die "Tarball '$TARBALL' not found in checksums file at $CHECKSUMS_URL"
+	fi
 	ACTUAL="$(cd "$TMPDIR" && sha256sum "$TARBALL" | awk '{print $1}')"
-	[ "$EXPECTED" = "$ACTUAL" ] || die "SHA-256 mismatch (expected $EXPECTED, got $ACTUAL)"
-	ok "SHA-256 matches"
+	if [ "$EXPECTED" != "$ACTUAL" ]; then
+		die "SHA-256 mismatch — expected $EXPECTED, got $ACTUAL. The tarball may be corrupted or tampered."
+	fi
+	ok "SHA-256 verified"
 else
-	warn "no checksums file at $CHECKSUMS_URL — installing without integrity check"
+	if [ "${PUBLIER_SKIP_CHECKSUM:-0}" = "1" ]; then
+		warn "PUBLIER_SKIP_CHECKSUM=1 — skipping integrity check"
+	else
+		die "Checksums file unavailable at $CHECKSUMS_URL. Set PUBLIER_SKIP_CHECKSUM=1 to bypass (not recommended)."
+	fi
 fi
 
 # --- SLSA provenance verification (optional) ----------------------------------
@@ -95,14 +104,14 @@ fi
 if command -v gh >/dev/null 2>&1; then
 	info "Verifying SLSA provenance attestation"
 	if gh attestation verify "$TMPDIR/$TARBALL" --repo "${RELEASES_REPO}" >/dev/null 2>&1; then
-		ok "provenance verified (gh attestation)"
+		ok "SLSA provenance verified"
 	else
-		warn "attestation verification failed or not yet published for this release"
-		warn "continuing with SHA-256-only trust; install gh ≥2.49 for strongest guarantee"
+		if [ "${PUBLIER_SKIP_ATTEST:-0}" = "1" ]; then
+			warn "PUBLIER_SKIP_ATTEST=1 — skipping provenance verification"
+		else
+			die "SLSA attestation verification failed for $TARBALL. Set PUBLIER_SKIP_ATTEST=1 to bypass (not recommended)."
+		fi
 	fi
-else
-	warn "gh CLI not installed — skipping SLSA provenance check"
-	warn "install https://cli.github.com/ for cryptographic install-time verification"
 fi
 
 # --- Install ------------------------------------------------------------------
@@ -134,6 +143,9 @@ if [ "$ON_PATH" = "0" ]; then
 fi
 
 printf "Next:\n"
-printf "  publier new my-docs     # scaffold a new project\n"
-printf "  publier login --token <your-token>    # cache your license token\n"
-printf "  https://publier.net/docs/get-started\n"
+printf "  publier new my-docs              # scaffold a new project\n"
+printf "  cd my-docs && pnpm install       # enter project and install deps\n"
+printf "  publier login --token <token>    # cache your license token\n"
+printf "  publier dev                      # start the dev server at http://localhost:4321\n"
+printf "\n"
+printf "  Docs: https://publier.net/docs/get-started\n"
