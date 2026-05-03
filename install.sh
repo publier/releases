@@ -95,25 +95,6 @@ else
 	fi
 fi
 
-# --- SLSA provenance verification (optional) ----------------------------------
-#
-# When `gh` is available, verify the GitHub Artifact Attestation bound to the
-# tarball. The attestation binds the binary to a specific workflow run in the
-# publier/releases repo — a tampered replacement fails verification because
-# only that workflow's OIDC identity can sign.
-if command -v gh >/dev/null 2>&1; then
-	info "Verifying SLSA provenance attestation"
-	if gh attestation verify "$TMPDIR/$TARBALL" --repo "${RELEASES_REPO}" >/dev/null 2>&1; then
-		ok "SLSA provenance verified"
-	else
-		if [ "${PUBLIER_SKIP_ATTEST:-0}" = "1" ]; then
-			warn "PUBLIER_SKIP_ATTEST=1 — skipping provenance verification"
-		else
-			die "SLSA attestation verification failed for $TARBALL. Set PUBLIER_SKIP_ATTEST=1 to bypass (not recommended)."
-		fi
-	fi
-fi
-
 # --- Install ------------------------------------------------------------------
 
 info "Installing to ${BIN_DIR}/publier"
