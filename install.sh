@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# publier CLI installer.
+#!/bin/sh
+# publier CLI installer. POSIX shell — verified with `dash -n install.sh`.
 #
 # curl -fsSL https://raw.githubusercontent.com/publier/releases/main/install.sh | sh
 #
