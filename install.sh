@@ -126,7 +126,7 @@ fi
 printf "Next:\n"
 printf "  publier new my-docs              # scaffold a new project\n"
 printf "  cd my-docs && pnpm install       # enter project and install deps\n"
-printf "  publier login --token <token>    # cache your license token\n"
+printf "  publier login                    # sign in (opens your browser)\n"
 printf "  publier dev                      # start the dev server at http://localhost:4321\n"
 printf "\n"
 printf "  Docs: https://publier.net/docs/get-started\n"
