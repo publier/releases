@@ -1,0 +1,274 @@
+name: 'Publier CI claim'
+description: >-
+  Mint a short-lived Publier CI-claim Biscuit for this job by exchanging the
+  job's GitHub Actions OIDC token against atestum's customer-facing
+  `POST /v1/ci/claim-biscuit` (ticket 04 of the publier-ci-customer-auth
+  spec). Requires the repository to be connected via the portal's "connect a
+  repo for CI" flow (ticket 07) and an active Publier subscription. Nothing
+  is stored: no PUBLIER_TOKEN secret, no signing key, no long-lived
+  credential anywhere in the repo.
+
+# Why this action lives in publier/releases, not publier/publier
+# ----------------------------------------------------------------
+# This action is meant to be referenced by CUSTOMER repos via
+# `uses: publier/releases/.github/actions/publier-ci-claim@main` — including
+# ZonHoren's own dogfood repo (zonhoren/marketing-sites), a DIFFERENT GitHub
+# org from `publier`. GitHub's private-repo action sharing
+# (Settings > Actions > "Accessible from repositories owned by...") is scoped
+# to repos owned by the SAME account/org as the private repo — it cannot be
+# granted to a different org, let alone an arbitrary customer's own account.
+# publier/publier is private; publier/releases is public and already the
+# distribution point for the CLI binary + install.sh, so this action was
+# moved here (from publier/publier, where it was originally built during
+# ticket 08) rather than trying to work around a restriction GitHub does not
+# offer a bypass for. Public repos are referenceable via `uses:` from any
+# caller regardless of owner, which is the actual requirement here.
+#
+# Why this is a SEPARATE action from publier/publier's ../publier-token
+# ----------------------------------------------------------------------
+# `publier-token` speaks RFC 8693 form-urlencoded token exchange against
+# `/v1/ci/token` — ZonHoren's own internal dogfood CI, not customer-facing,
+# and it mints an at+jwt. This action speaks a bespoke JSON contract against
+# `/v1/ci/claim-biscuit` and mints a Biscuit instead — deliberately distinct
+# wire shapes on the atestum side (see that route's own module doc), so this
+# is a distinct action rather than a mode flag on the existing one. Unlike
+# publier-token, this one is public because customer repos must be able to
+# reference it directly.
+#
+# Requires `id-token: write` in the CALLING JOB's permissions block. This
+# action fails closed with a pointed error when it isn't granted.
+#
+# Trust binding note (for whoever maintains the atestum side): GitHub's `sub`
+# claim is NOT immutable on an arbitrary customer's repo (use_immutable_subject
+# is per-repo, admin-customizable, and this repo has no control over a
+# customer's setting), so the server must bind on `repository_id` /
+# `repository_owner_id`, never on `sub`. Nothing in this action can enforce
+# that; it is recorded here so the constraint is visible from the client side
+# (mirrors the same note in publier/publier's publier-token/action.yml).
+
+inputs:
+  audience:
+    description: >-
+      Audience requested for the GitHub OIDC token. Atestum's
+      `publier_ci_audience` config must match this value.
+    required: false
+    default: 'publier-ci'
+  endpoint:
+    description: 'The /v1/ci/claim-biscuit endpoint on atestum.'
+    required: false
+    default: 'https://atestum.com/v1/ci/claim-biscuit'
+  env-file:
+    description: >-
+      Optional path to write `PUBLIER_TOKEN=<biscuit>` to, created mode 0600.
+      Only needed by consumers that do not inherit the runner environment —
+      melange runs `--clearenv`, so its `--env-file` is the only way in. Keep
+      this OUTSIDE the repo checkout (point it at the runner temp dir, e.g.
+      the RUNNER_TEMP env var) so it can never be copied into a build
+      artifact. NOTE: do not write a literal GitHub expression in this file's
+      metadata — GitHub parses expressions in action.yml inputs/outputs, and
+      contexts like `runner` are not available there, so one in a
+      *description* fails the whole action with "Unrecognized named-value"
+      at load time.
+    required: false
+    default: ''
+  seed-cli-config:
+    description: >-
+      Write `<endpoint's origin>/publier/cli-config`'s response verbatim to
+      the CLI's cache (`~/.config/publier/cli-config.json`, honouring
+      XDG_CONFIG_HOME) so an offline Biscuit verification can find the
+      platform's root public key. Leave on unless the consumer does its own
+      fetching. See the step below for why this is required, not a
+      convenience — mirrors publier-token's JWKS-seeding step for the same
+      reason, one config field instead of a JWKS. CAVEAT: this writes to the
+      RUNNER's own $HOME, which a melange/bubblewrap `--clearenv` sandbox
+      never sees. A caller building inside such a sandbox (e.g. marketing-
+      sites' deploy-publier.yml) should set this to 'false' and rely on
+      zonhoren/marketing-sites' `publier-jwks-seed` action instead — it
+      already fetches this SAME `/publier/cli-config` document (which
+      carries `biscuit_root_key` since ticket 05) and bridges it into the
+      env-file as `PUBLIER_CLI_CONFIG_CACHE_B64` for the sandbox to decode.
+    required: false
+    default: 'true'
+
+outputs:
+  token:
+    description: >-
+      The minted Biscuit (URL-safe base64, no padding). Registered as a log
+      mask the moment it is parsed, so it is safe to pass through `env:` on
+      consuming steps.
+    value: ${{ steps.claim.outputs.token }}
+  expires-in:
+    description: 'Biscuit lifetime in seconds, as reported by the claim endpoint.'
+    value: ${{ steps.claim.outputs.expires-in }}
+
+runs:
+  using: composite
+  steps:
+    - name: Exchange GitHub OIDC token for a Publier CI-claim Biscuit
+      id: claim
+      shell: bash
+      env:
+        # Inputs are passed through env rather than interpolated into the
+        # script body so a value containing shell metacharacters can never be
+        # executed.
+        PUBLIER_CLAIM_AUDIENCE: ${{ inputs.audience }}
+        PUBLIER_CLAIM_ENDPOINT: ${{ inputs.endpoint }}
+        PUBLIER_CLAIM_ENV_FILE: ${{ inputs.env-file }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::No GitHub OIDC token available. Add 'id-token: write' to this job's permissions block."
+          exit 1
+        fi
+
+        umask 077
+        work="$(mktemp -d)"
+        trap 'rm -rf "$work"' EXIT
+
+        # --- 1. GitHub Actions OIDC token, audience-bound --------------------
+        # ACTIONS_ID_TOKEN_REQUEST_URL already carries a query string
+        # (?api-version=...); `-G --data-urlencode` appends with `&` and
+        # percent-encodes the audience, so no hand-built URL concatenation.
+        # Retries use curl's own exponential backoff (1s, 2s, 4s) — deliberately
+        # NO --retry-delay, which would pin it to a fixed interval.
+        if ! curl --silent --show-error --fail-with-body \
+                  --retry 3 --retry-all-errors --retry-max-time 60 \
+                  --connect-timeout 10 --max-time 30 \
+                  -G --data-urlencode "audience=${PUBLIER_CLAIM_AUDIENCE}" \
+                  -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+                  -H 'Accept: application/json' \
+                  -o "$work/oidc.json" \
+                  "$ACTIONS_ID_TOKEN_REQUEST_URL"; then
+          echo "::error::Could not fetch the GitHub Actions OIDC token (audience=${PUBLIER_CLAIM_AUDIENCE})."
+          exit 1
+        fi
+
+        jq -j '.value // empty' < "$work/oidc.json" > "$work/subject_token"
+        if [ ! -s "$work/subject_token" ]; then
+          echo "::error::GitHub OIDC endpoint returned no token value."
+          exit 1
+        fi
+        # Mask before anything else can surface it. The subject token is a
+        # credential in its own right, even though it is only usable here.
+        echo "::add-mask::$(cat "$work/subject_token")"
+
+        # --- 2. Exchange against /v1/ci/claim-biscuit ------------------------
+        # Bespoke JSON contract (NOT RFC 8693 form-urlencoded like
+        # publier-token's /v1/ci/token) — see this action's own header. `jq -n
+        # --rawfile` builds the JSON body so the JWT never touches argv
+        # (visible to any process on the runner via /proc) and is never
+        # shell-interpolated.
+        jq -n --rawfile t "$work/subject_token" '{subject_token: $t}' > "$work/req.json"
+
+        if ! curl --silent --show-error --fail-with-body \
+                  --retry 3 --retry-all-errors --retry-max-time 60 \
+                  --connect-timeout 10 --max-time 30 \
+                  -X POST "$PUBLIER_CLAIM_ENDPOINT" \
+                  -H 'Content-Type: application/json' \
+                  -H 'Accept: application/json' \
+                  --data-binary "@$work/req.json" \
+                  -o "$work/resp.json"; then
+          echo "::error::Claim against ${PUBLIER_CLAIM_ENDPOINT} failed."
+          # Surface only the structured error fields, never the whole body.
+          if jq -e 'type == "object"' "$work/resp.json" >/dev/null 2>&1; then
+            jq -r '"  code: \(.error.code // "?")\n  message: \(.error.message // "?")"' \
+              "$work/resp.json" >&2 || true
+          else
+            head -c 500 "$work/resp.json" >&2 || true
+            echo >&2
+          fi
+          exit 1
+        fi
+
+        biscuit="$(jq -j '.biscuit // empty' < "$work/resp.json")"
+        if [ -z "$biscuit" ]; then
+          echo "::error::${PUBLIER_CLAIM_ENDPOINT} returned no biscuit."
+          exit 1
+        fi
+        echo "::add-mask::$biscuit"
+
+        # Fail closed on anything that could break out of the `key=value` line
+        # written to $GITHUB_OUTPUT / the env file below.
+        case "$biscuit" in
+          *[[:space:]]*)
+            echo "::error::Minted Biscuit contains whitespace — refusing to propagate it."
+            exit 1
+            ;;
+        esac
+
+        expires_in="$(jq -j '.expires_in // empty' < "$work/resp.json")"
+        case "$expires_in" in
+          ''|*[!0-9]*) expires_in='' ;;
+        esac
+
+        {
+          echo "token=$biscuit"
+          echo "expires-in=$expires_in"
+        } >> "$GITHUB_OUTPUT"
+
+        # --- 3. Optional env file (melange --clearenv consumers) -------------
+        # Create-if-absent + always APPEND. A caller commonly chains this
+        # after publier-jwks-seed onto the SAME env-file (melange consumers
+        # need both PUBLIER_TOKEN and the JWKS/cli-config cache bridge) — an
+        # unconditional recreate-and-truncate here would silently wipe
+        # whatever an earlier step already wrote to that file. Mirrors
+        # publier-jwks-seed's own env-file write for the same reason.
+        if [ -n "${PUBLIER_CLAIM_ENV_FILE:-}" ]; then
+          mkdir -p "$(dirname "$PUBLIER_CLAIM_ENV_FILE")"
+          [ -f "$PUBLIER_CLAIM_ENV_FILE" ] || install -m 600 /dev/null "$PUBLIER_CLAIM_ENV_FILE"
+          printf 'PUBLIER_TOKEN=%s\n' "$biscuit" >> "$PUBLIER_CLAIM_ENV_FILE"
+          echo "Wrote PUBLIER_TOKEN to ${PUBLIER_CLAIM_ENV_FILE} (mode 0600)."
+        fi
+
+        echo "Minted Publier CI-claim Biscuit: audience=${PUBLIER_CLAIM_AUDIENCE}, length=${#biscuit}, expires_in=${expires_in:-unreported}s."
+
+    # --- 4. Seed the offline verifier's trust anchor -----------------------
+    # REQUIRED for a consumer running directly on the runner — NOT sufficient
+    # for a melange/bubblewrap `--clearenv` sandbox consumer, which never sees
+    # this runner's $HOME/.config (see the `seed-cli-config` input doc above
+    # for the fix in that case). Mirrors publier-token's JWKS-seeding step for
+    # the same underlying reason. license-core's Biscuit verification path
+    # reads the platform's root public key from the CACHED `/publier/cli-config`
+    # document (`CliConfig::biscuit_root_key`), never fetching it itself — see
+    # publier/publier's `rust/license-core/src/verify.rs`'s own doc: "cached
+    # from GET /publier/cli-config". A fresh CI container has no such cache
+    # (only `publier login`'s interactive flow normally writes one), so
+    # exporting PUBLIER_TOKEN alone yields UNVERIFIABLE (LicenseError::NoKeys)
+    # and every build fails even with a perfectly good Biscuit. `read_cache()`
+    # does a plain `serde_json::from_str` of the file, so it must be EXACTLY
+    # the response body — no wrapping.
+    - name: Seed the Publier CLI config cache for offline Biscuit verification
+      if: inputs.seed-cli-config == 'true'
+      shell: bash
+      env:
+        PUBLIER_CLAIM_ENDPOINT: ${{ inputs.endpoint }}
+      run: |
+        set -euo pipefail
+        umask 077
+
+        origin="${PUBLIER_CLAIM_ENDPOINT%%/v1/ci/claim-biscuit}"
+        cache_dir="${XDG_CONFIG_HOME:-$HOME/.config}/publier"
+        mkdir -p "$cache_dir"
+
+        if ! curl --silent --show-error --fail-with-body \
+                  --retry 3 --retry-all-errors --retry-max-time 60 \
+                  --connect-timeout 10 --max-time 30 \
+                  -H 'Accept: application/json' \
+                  -o "$cache_dir/cli-config.json.tmp" \
+                  "${origin}/publier/cli-config"; then
+          echo "::error::Could not fetch ${origin}/publier/cli-config."
+          exit 1
+        fi
+
+        # Fail closed rather than cache a document with no root key — a cache
+        # without one would look valid and fail later, further from the cause.
+        if ! jq -er '.biscuit_root_key // empty' < "$cache_dir/cli-config.json.tmp" >/dev/null; then
+          rm -f "$cache_dir/cli-config.json.tmp"
+          echo "::error::${origin}/publier/cli-config has no biscuit_root_key — is ticket 05 deployed on this Instance?"
+          exit 1
+        fi
+
+        chmod 644 "$cache_dir/cli-config.json.tmp"
+        mv "$cache_dir/cli-config.json.tmp" "$cache_dir/cli-config.json"
+        echo "Seeded CLI config cache (with biscuit_root_key) at ${cache_dir}/cli-config.json."
