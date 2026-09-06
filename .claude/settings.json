@@ -1,0 +1,12 @@
+{
+  "enabledPlugins": {
+    "gopls-lsp@claude-plugins-official": false,
+    "rust-analyzer-lsp@claude-plugins-official": false,
+    "frontend-design@claude-plugins-official": false,
+    "temporal@temporal-marketplace": false
+  },
+  "skillOverrides": {
+    "temporal:temporal-cloud-setup": "off",
+    "temporal:temporal-developer": "off"
+  }
+}
