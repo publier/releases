@@ -195,7 +195,7 @@ runs:
     # silently alter every customer's CI auth.
     - name: Claim a per-run Atestum Biscuit
       id: claim
-      uses: Atestum/setup-atestum@v1.0.3
+      uses: Atestum/setup-atestum@v1.0.4
       with:
         api-url: ${{ steps.base.outputs.api-url }}
         tenant: ${{ inputs.tenant }}
