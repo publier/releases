@@ -140,6 +140,16 @@ outputs:
       Biscuit lifetime in seconds, derived from the claim's RFC 3339
       `expires-at`. Empty if the endpoint reported no expiry.
     value: ${{ steps.publier.outputs.expires-in }}
+  proof-key:
+    description: >-
+      Path to the ephemeral Ed25519 private key file setup-atestum generated
+      in tmpfs for this run (pass-through of its own `proof-key` output).
+      `license-core`'s Biscuit-verify path (`publier/publier`
+      `rust/license-core/src/verify.rs`) reads this to sign the per-request
+      DPoP proof `POST /v1/ci/verify` needs — see that file's module doc for
+      why an offline check can never satisfy this on its own. The file is
+      never read or copied by this action; only its path is forwarded.
+    value: ${{ steps.claim.outputs.proof-key }}
 
 runs:
   using: composite
@@ -200,6 +210,7 @@ runs:
         # value containing shell metacharacters can never be executed.
         CLAIM_BISCUIT: ${{ steps.claim.outputs.biscuit }}
         CLAIM_EXPIRES_AT: ${{ steps.claim.outputs.expires-at }}
+        CLAIM_PROOF_KEY: ${{ steps.claim.outputs.proof-key }}
         PUBLIER_CLAIM_ENV_FILE: ${{ inputs.env-file }}
       run: |
         set -euo pipefail
@@ -254,6 +265,16 @@ runs:
           mkdir -p "$(dirname "$PUBLIER_CLAIM_ENV_FILE")"
           [ -f "$PUBLIER_CLAIM_ENV_FILE" ] || install -m 600 /dev/null "$PUBLIER_CLAIM_ENV_FILE"
           printf 'PUBLIER_TOKEN=%s\n' "$biscuit" >> "$PUBLIER_CLAIM_ENV_FILE"
+          # Same sandbox-visibility caveat as `seed-cli-config` above: this is
+          # a PATH into the runner's own tmpfs, which a melange/bubblewrap
+          # `--clearenv` sandbox does not see unless that directory is
+          # separately bind-mounted in. Written unconditionally anyway (a
+          # consumer that doesn't need it just ignores the var) rather than
+          # adding a second opt-out input for a caveat only a sandboxed
+          # consumer needs to solve.
+          if [ -n "${CLAIM_PROOF_KEY:-}" ]; then
+            printf 'PUBLIER_PROOF_KEY=%s\n' "$CLAIM_PROOF_KEY" >> "$PUBLIER_CLAIM_ENV_FILE"
+          fi
           echo "Wrote PUBLIER_TOKEN to ${PUBLIER_CLAIM_ENV_FILE} (mode 0600)."
         fi
 
