@@ -1,0 +1,21 @@
+# Dependabot — keep the composite action's own `uses:` pins current.
+#
+# The github-actions ecosystem only reads action.yml files under a listed
+# directory, so the composite action's directory is named explicitly; listing
+# `/` alone would scan .github/workflows (absent here) and bump nothing.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - /.github/actions/publier-ci-claim
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:17"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci(deps)"
+    open-pull-requests-limit: 5
