@@ -1,8 +1,8 @@
 name: 'Publier CI claim'
 description: >-
   Mint a short-lived Publier CI-claim Biscuit for this job via Atestum's
-  generic Workload Identity claim (`POST /v1/ci/claim`), then expose it as
-  PUBLIER_TOKEN and cache the public verification configuration. CI builds
+  generic Workload Identity claim (`POST /v1/ci/claim`), then expose token and
+  proof-key outputs and cache the public verification configuration. CI builds
   verify the credential online using an ephemeral proof key. Requires the
   repository to be connected via the portal's "connect a repo for CI" flow and
   an active Publier subscription. Nothing is stored: no PUBLIER_TOKEN secret,
@@ -47,10 +47,11 @@ inputs:
     default: ''
   env-file:
     description: >-
-      Optional path to write `PUBLIER_TOKEN=<biscuit>` and
-      `ATESTUM_PROOF_KEY=<key-path>` to, created mode 0600.
-      Only needed by consumers that do not inherit the runner environment —
-      melange runs `--clearenv`, so its `--env-file` is the only way in. Keep
+      Optional mode-0600 environment file containing `PUBLIER_TOKEN=<biscuit>`
+      and `ATESTUM_PROOF_KEY=<key-path>`. Ordinary runner steps must bind the
+      token and proof-key outputs explicitly; this wrapper does not export
+      PUBLIER_TOKEN to the runner environment. Use the file when your build
+      consumes an env-file, such as an isolated sandbox. Keep
       this OUTSIDE the repo checkout (point it at the runner temp dir, e.g.
       the RUNNER_TEMP env var) so it can never be copied into a build
       artifact. NOTE: do not write a literal GitHub expression in this file's
@@ -130,7 +131,7 @@ runs:
         tenant: ${{ inputs.tenant }}
         github-token: ${{ inputs.github-token }}
 
-    - name: Export PUBLIER_TOKEN
+    - name: Expose the Publier credential
       id: publier
       shell: bash
       env:
@@ -175,6 +176,7 @@ runs:
         if [ -n "${PUBLIER_CLAIM_ENV_FILE:-}" ]; then
           mkdir -p "$(dirname "$PUBLIER_CLAIM_ENV_FILE")"
           [ -f "$PUBLIER_CLAIM_ENV_FILE" ] || install -m 600 /dev/null "$PUBLIER_CLAIM_ENV_FILE"
+          chmod 600 "$PUBLIER_CLAIM_ENV_FILE"
           printf 'PUBLIER_TOKEN=%s\n' "$biscuit" >> "$PUBLIER_CLAIM_ENV_FILE"
           if [ -n "${CLAIM_PROOF_KEY:-}" ]; then
             printf 'ATESTUM_PROOF_KEY=%s\n' "$CLAIM_PROOF_KEY" >> "$PUBLIER_CLAIM_ENV_FILE"
