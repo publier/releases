@@ -47,7 +47,8 @@ inputs:
     default: ''
   env-file:
     description: >-
-      Optional path to write `PUBLIER_TOKEN=<biscuit>` to, created mode 0600.
+      Optional path to write `PUBLIER_TOKEN=<biscuit>` and
+      `ATESTUM_PROOF_KEY=<key-path>` to, created mode 0600.
       Only needed by consumers that do not inherit the runner environment —
       melange runs `--clearenv`, so its `--env-file` is the only way in. Keep
       this OUTSIDE the repo checkout (point it at the runner temp dir, e.g.
@@ -66,6 +67,7 @@ inputs:
       unless the consumer fetches this configuration itself. For an isolated
       build sandbox, copy the public configuration into that sandbox's
       Publier config directory; the runner's home directory is not inherited.
+      The proof-key file must also be readable at its supplied path inside the sandbox.
     required: false
     default: 'true'
 
@@ -84,7 +86,7 @@ outputs:
   proof-key:
     description: >-
       Path to the ephemeral signing key created for this run. Pass this as
-      PUBLIER_PROOF_KEY so the build can prove possession during online CI
+      ATESTUM_PROOF_KEY so the build can prove possession during online CI
       verification. Keep the file outside source and build artifacts. This
       action forwards the path without reading or copying the key.
     value: ${{ steps.claim.outputs.proof-key }}
@@ -175,9 +177,9 @@ runs:
           [ -f "$PUBLIER_CLAIM_ENV_FILE" ] || install -m 600 /dev/null "$PUBLIER_CLAIM_ENV_FILE"
           printf 'PUBLIER_TOKEN=%s\n' "$biscuit" >> "$PUBLIER_CLAIM_ENV_FILE"
           if [ -n "${CLAIM_PROOF_KEY:-}" ]; then
-            printf 'PUBLIER_PROOF_KEY=%s\n' "$CLAIM_PROOF_KEY" >> "$PUBLIER_CLAIM_ENV_FILE"
+            printf 'ATESTUM_PROOF_KEY=%s\n' "$CLAIM_PROOF_KEY" >> "$PUBLIER_CLAIM_ENV_FILE"
           fi
-          echo "Wrote PUBLIER_TOKEN to ${PUBLIER_CLAIM_ENV_FILE} (mode 0600)."
+          echo "Wrote Publier credential environment to ${PUBLIER_CLAIM_ENV_FILE} (mode 0600)."
         fi
 
         echo "Minted Publier CI-claim Biscuit: length=${#biscuit}, expires_in=${expires_in:-unreported}s."
