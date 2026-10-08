@@ -2,65 +2,12 @@ name: 'Publier CI claim'
 description: >-
   Mint a short-lived Publier CI-claim Biscuit for this job via Atestum's
   generic Workload Identity claim (`POST /v1/ci/claim`), then expose it as
-  PUBLIER_TOKEN and seed the offline verifier's trust anchor. Requires the
+  PUBLIER_TOKEN and cache the public verification configuration. CI builds
+  verify the credential online using an ephemeral proof key. Requires the
   repository to be connected via the portal's "connect a repo for CI" flow and
   an active Publier subscription. Nothing is stored: no PUBLIER_TOKEN secret,
   no signing key, no long-lived credential anywhere in the repo.
 
-# Why this action lives in publier/releases, not publier/publier
-# ----------------------------------------------------------------
-# This action is meant to be referenced by CUSTOMER repos via
-# `uses: publier/releases/.github/actions/publier-ci-claim@main` — including
-# ZonHoren's own dogfood repo (zonhoren/marketing-sites), a DIFFERENT GitHub
-# org from `publier`. GitHub's private-repo action sharing
-# (Settings > Actions > "Accessible from repositories owned by...") is scoped
-# to repos owned by the SAME account/org as the private repo — it cannot be
-# granted to a different org, let alone an arbitrary customer's own account.
-# publier/publier is private; publier/releases is public and already the
-# distribution point for the CLI binary + install.sh, so this action lives
-# here. Public repos are referenceable via `uses:` from any caller regardless
-# of owner, which is the actual requirement here.
-#
-# ADR-0008 cutover (2026-09-05) — what changed and why
-# ----------------------------------------------------
-# This action used to exchange the job's GitHub Actions OIDC token against
-# atestum's bespoke `POST /v1/ci/claim-biscuit`. ADR-0008
-# (`atestum/atestum` docs/adr/0008-publier-ci-auth-onto-workload-identity.md)
-# RETIRED that endpoint — it now 404s in production — because it hardcoded
-# Publier's product name into Atestum's lowest trust primitive. Publier CI now
-# rides Atestum's generic Workload Identity path, exactly like every other
-# Atestum tenant's CI.
-#
-# That is a different auth mechanism, not a different URL: the new flow
-# presents the run's GITHUB_TOKEN (validated against the GitHub Workflow Run
-# API as proof of run identity) plus an ephemeral Ed25519 public key the runner
-# generates, rather than an OIDC token. `Atestum/setup-atestum` already
-# implements that handshake — keypair generation in tmpfs, the claim body,
-# retry/backoff, and the on-demand fallback when the webhook lost the race — so
-# this action DELEGATES the claim to it rather than reimplementing a
-# credential-handling flow. setup-atestum is public, so a customer repo in any
-# org can still resolve this whole chain.
-#
-# What this action still owns, and why it is not just an alias:
-#   * `PUBLIER_TOKEN` naming + the `token` / `expires-in` output contract its
-#     existing callers already consume.
-#   * The optional `env-file` bridge for melange/bubblewrap `--clearenv`
-#     consumers, which never inherit the runner environment.
-#   * Seeding `/publier/cli-config` into the CLI cache so license-core can
-#     verify the Biscuit offline (see that step's own comment — without it
-#     every build fails NoKeys even with a perfectly good Biscuit).
-#
-# PERMISSIONS CHANGE FOR CALLERS: this action no longer needs `id-token: write`
-# (there is no OIDC token to request). It now needs `actions: read`, so Atestum
-# can call the Workflow Run API to verify the run. Leaving `id-token: write` in
-# place is harmless, but `actions: read` must be added or the claim fails.
-#
-# Trust binding note (for whoever maintains the atestum side): GitHub's `sub`
-# claim is NOT immutable on an arbitrary customer's repo (use_immutable_subject
-# is per-repo, admin-customizable, and this repo has no control over a
-# customer's setting), so the server must bind on `repository_id` /
-# `repository_owner_id`, never on `sub`. Nothing in this action can enforce
-# that; it is recorded here so the constraint is visible from the client side.
 
 inputs:
   api-url:
@@ -114,17 +61,11 @@ inputs:
     default: ''
   seed-cli-config:
     description: >-
-      Write `<api-url>/publier/cli-config`'s response verbatim to the CLI's
-      cache (`~/.config/publier/cli-config.json`, honouring XDG_CONFIG_HOME) so
-      an offline Biscuit verification can find the platform's root public key.
-      Leave on unless the consumer does its own fetching. CAVEAT: this writes
-      to the RUNNER's own $HOME, which a melange/bubblewrap `--clearenv` sandbox
-      never sees. A caller building inside such a sandbox (e.g. marketing-
-      sites' deploy-publier.yml) should set this to 'false' and rely on
-      zonhoren/marketing-sites' `publier-jwks-seed` action instead — it
-      already fetches this SAME `/publier/cli-config` document (which
-      carries `biscuit_root_key`) and bridges it into the env-file as
-      `PUBLIER_CLI_CONFIG_CACHE_B64` for the sandbox to decode.
+      Cache the public verification configuration from
+      `<api-url>/publier/cli-config`, honouring XDG_CONFIG_HOME. Leave enabled
+      unless the consumer fetches this configuration itself. For an isolated
+      build sandbox, copy the public configuration into that sandbox's
+      Publier config directory; the runner's home directory is not inherited.
     required: false
     default: 'true'
 
@@ -142,23 +83,15 @@ outputs:
     value: ${{ steps.publier.outputs.expires-in }}
   proof-key:
     description: >-
-      Path to the ephemeral Ed25519 private key file setup-atestum generated
-      in tmpfs for this run (pass-through of its own `proof-key` output).
-      `license-core`'s Biscuit-verify path (`publier/publier`
-      `rust/license-core/src/verify.rs`) reads this to sign the per-request
-      DPoP proof `POST /v1/ci/verify` needs — see that file's module doc for
-      why an offline check can never satisfy this on its own. The file is
-      never read or copied by this action; only its path is forwarded.
+      Path to the ephemeral signing key created for this run. Pass this as
+      PUBLIER_PROOF_KEY so the build can prove possession during online CI
+      verification. Keep the file outside source and build artifacts. This
+      action forwards the path without reading or copying the key.
     value: ${{ steps.claim.outputs.proof-key }}
 
 runs:
   using: composite
   steps:
-    # --- 0. Resolve the control-plane base URL ----------------------------
-    # `endpoint` used to be a FULL url ending in the now-retired
-    # /v1/ci/claim-biscuit. Reduce whatever we were given to a bare origin so
-    # both the old and new spellings work, and so the cli-config step below
-    # cannot inherit a stale path suffix.
     - name: Resolve Atestum base URL
       id: base
       shell: bash
@@ -172,7 +105,6 @@ runs:
         [ -n "$raw" ] || raw="${INPUT_API_URL:-}"
         [ -n "$raw" ] || raw='https://atestum.com'
 
-        # Strip any known claim path, then any trailing slash.
         raw="${raw%/v1/ci/claim-biscuit}"
         raw="${raw%/v1/ci/claim}"
         raw="${raw%/}"
@@ -188,11 +120,6 @@ runs:
         echo "api-url=$raw" >> "$GITHUB_OUTPUT"
         echo "Using Atestum control plane at ${raw}."
 
-    # --- 1. Claim the per-run Biscuit -------------------------------------
-    # Delegated: see the ADR-0008 note in this file's header for why this is
-    # not a hand-rolled curl exchange any more. Pinned to a released tag on a
-    # first-party org repo rather than @main, so a change upstream cannot
-    # silently alter every customer's CI auth.
     - name: Claim a per-run Atestum Biscuit
       id: claim
       uses: Atestum/setup-atestum@v1.0.5
@@ -201,13 +128,10 @@ runs:
         tenant: ${{ inputs.tenant }}
         github-token: ${{ inputs.github-token }}
 
-    # --- 2. Republish under this action's own contract --------------------
     - name: Export PUBLIER_TOKEN
       id: publier
       shell: bash
       env:
-        # Passed through env rather than interpolated into the script body so a
-        # value containing shell metacharacters can never be executed.
         CLAIM_BISCUIT: ${{ steps.claim.outputs.biscuit }}
         CLAIM_EXPIRES_AT: ${{ steps.claim.outputs.expires-at }}
         CLAIM_PROOF_KEY: ${{ steps.claim.outputs.proof-key }}
@@ -221,12 +145,8 @@ runs:
           echo "::error::setup-atestum returned no biscuit."
           exit 1
         fi
-        # setup-atestum masks it already; re-assert cheaply in case that ever
-        # regresses — a double mask is harmless, a missing one is not.
         echo "::add-mask::$biscuit"
 
-        # Fail closed on anything that could break out of the `key=value` line
-        # written to $GITHUB_OUTPUT / the env file below.
         case "$biscuit" in
           *[[:space:]]*)
             echo "::error::Minted Biscuit contains whitespace — refusing to propagate it."
@@ -234,11 +154,6 @@ runs:
             ;;
         esac
 
-        # `expires-in` (seconds) is this action's historical contract;
-        # setup-atestum reports an RFC 3339 `expires-at`. Convert, and degrade
-        # to empty rather than failing the build if `date` cannot parse it —
-        # the lifetime is advisory, the Biscuit's own `check if time(...)` is
-        # what actually enforces expiry.
         expires_in=''
         if [ -n "${CLAIM_EXPIRES_AT:-}" ]; then
           if exp_epoch="$(date -u -d "$CLAIM_EXPIRES_AT" +%s 2>/dev/null)"; then
@@ -255,23 +170,10 @@ runs:
           echo "expires-in=$expires_in"
         } >> "$GITHUB_OUTPUT"
 
-        # --- Optional env file (melange --clearenv consumers) --------------
-        # Create-if-absent + always APPEND. A caller commonly chains this
-        # after publier-jwks-seed onto the SAME env-file (melange consumers
-        # need both PUBLIER_TOKEN and the JWKS/cli-config cache bridge) — an
-        # unconditional recreate-and-truncate here would silently wipe
-        # whatever an earlier step already wrote to that file.
         if [ -n "${PUBLIER_CLAIM_ENV_FILE:-}" ]; then
           mkdir -p "$(dirname "$PUBLIER_CLAIM_ENV_FILE")"
           [ -f "$PUBLIER_CLAIM_ENV_FILE" ] || install -m 600 /dev/null "$PUBLIER_CLAIM_ENV_FILE"
           printf 'PUBLIER_TOKEN=%s\n' "$biscuit" >> "$PUBLIER_CLAIM_ENV_FILE"
-          # Same sandbox-visibility caveat as `seed-cli-config` above: this is
-          # a PATH into the runner's own tmpfs, which a melange/bubblewrap
-          # `--clearenv` sandbox does not see unless that directory is
-          # separately bind-mounted in. Written unconditionally anyway (a
-          # consumer that doesn't need it just ignores the var) rather than
-          # adding a second opt-out input for a caveat only a sandboxed
-          # consumer needs to solve.
           if [ -n "${CLAIM_PROOF_KEY:-}" ]; then
             printf 'PUBLIER_PROOF_KEY=%s\n' "$CLAIM_PROOF_KEY" >> "$PUBLIER_CLAIM_ENV_FILE"
           fi
@@ -280,21 +182,7 @@ runs:
 
         echo "Minted Publier CI-claim Biscuit: length=${#biscuit}, expires_in=${expires_in:-unreported}s."
 
-    # --- 3. Seed the offline verifier's trust anchor -----------------------
-    # REQUIRED for a consumer running directly on the runner — NOT sufficient
-    # for a melange/bubblewrap `--clearenv` sandbox consumer, which never sees
-    # this runner's $HOME/.config (see the `seed-cli-config` input doc above
-    # for the fix in that case). license-core's Biscuit verification path
-    # reads the platform's root public key from the CACHED `/publier/cli-config`
-    # document (`CliConfig::biscuit_root_key`), never fetching it itself — see
-    # publier/publier's `rust/license-core/src/verify.rs`'s own doc: "cached
-    # from GET /publier/cli-config". A fresh CI container has no such cache
-    # (only `publier login`'s interactive flow normally writes one), so
-    # exporting PUBLIER_TOKEN alone yields UNVERIFIABLE (LicenseError::NoKeys)
-    # and every build fails even with a perfectly good Biscuit. `read_cache()`
-    # does a plain `serde_json::from_str` of the file, so it must be EXACTLY
-    # the response body — no wrapping.
-    - name: Seed the Publier CLI config cache for offline Biscuit verification
+    - name: Cache the Publier public verification configuration
       if: inputs.seed-cli-config == 'true'
       shell: bash
       env:
@@ -317,8 +205,6 @@ runs:
           exit 1
         fi
 
-        # Fail closed rather than cache a document with no root key — a cache
-        # without one would look valid and fail later, further from the cause.
         if ! jq -er '.biscuit_root_key // empty' < "$cache_dir/cli-config.json.tmp" >/dev/null; then
           rm -f "$cache_dir/cli-config.json.tmp"
           echo "::error::${origin}/publier/cli-config has no biscuit_root_key."
